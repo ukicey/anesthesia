@@ -72,6 +72,10 @@ mcts_simulations = 50  # MCTS每次搜索的模拟次数
 mcts_c_puct = 1.0  # MCTS的探索常数（UCB）
 use_mcts_margin = 0.1  # MCTS动作需要比专家好多少才使用（margin）
 
+# 训练策略配置
+warmup_epochs = 10  # 前N个epoch只训练环境模型，不训练policy
+env_loss_weight = 2.0  # warmup后，环境模型loss的权重（相对policy）
+
 # 其他选项（预留）
 use_scheduled_sampling = False  # 是否使用scheduled sampling
 scheduled_sampling_decay = 0.01  # scheduled sampling的衰减率（每epoch）

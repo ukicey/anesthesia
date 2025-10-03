@@ -133,6 +133,10 @@ class RLSLModelModule(BaseModule):
         self.loss_state_weight = self.module_args.get('loss_state_weight', 0.1)
         self.loss_rl_weight = self.module_args.get('loss_rl_weight', 1.0)
         self.loss_joint = self.module_args.get('loss_rl_joint', True)
+        
+        # 训练策略配置
+        self.warmup_epochs = warmup_epochs
+        self.env_loss_weight = env_loss_weight
 
     def forward(self, x):
         """
@@ -243,15 +247,26 @@ class RLSLModelModule(BaseModule):
             loss_rp,true_rp = cross_entropy(pred_rp, rp_target)
             #loss_rp = masked_loss(F.mse_loss, pred_rp.squeeze(-1), rp_target, mask=None)
 
-           
-
-            loss =loss_action +loss_bis+loss_rp +loss_value + loss_reward 
+            # 训练策略：Warm-up + 加权
+            loss_env = loss_bis + loss_rp + loss_value + loss_reward
+            
+            if self.current_epoch < self.warmup_epochs:
+                # Phase 1: Warm-up阶段，只训练环境模型
+                loss = loss_env
+                # 记录：warmup阶段不训练policy
+                in_warmup = True
+            else:
+                # Phase 2: 联合训练，但环境模型loss权重更大
+                loss = loss_action + self.env_loss_weight * loss_env
+                in_warmup = False
+            
             # 计算并打印各个损失及其加权总和
             # print("Action:", str(loss_action) +
             #   " Rp:", str(loss_rp) +
             #   " Bis:", str(loss_bis) +
             #   " Value:", str(loss_value) +
-            #   " Reward:", str(loss_reward))
+            #   " Reward:", str(loss_reward) +
+            #   " Warmup:", str(in_warmup))
 
         losses = {
             '_step_mask': step_mask,
@@ -301,6 +316,10 @@ class RLSLModelModule(BaseModule):
             self.train_loss = 0
         self.log("train_loss", self.train_loss, prog_bar=False, sync_dist=True)
         self.log("val_loss", loss, prog_bar=False, sync_dist=True)
+        
+        # 记录是否在warmup阶段
+        in_warmup = self.current_epoch < self.warmup_epochs
+        self.log("in_warmup", float(in_warmup), prog_bar=True, sync_dist=True)
 
         action = label_data['action']
 
