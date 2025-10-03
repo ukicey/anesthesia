@@ -239,11 +239,9 @@ class TransformerPlanningModel(nn.Module):
             state_t = state_t_next
 
 
-        # Stage 2: 训练actor（policy函数），用Stage 1得到的环境模型 rollout
-        # 在这里 dynamics 模块本身因 state 传递到策略 logits（参与行为克隆交叉熵）会被反向更新
-        # dynamics 可能学到“对预测动作更友好”而非真实转移，削弱模拟准确性，出现 model exploitation
-        # 训练目标混杂：dynamics 同时最小化奖励/生命体征监督 + 行为克隆的隐式表征约束，可能导致表示折中。
-        # 可尝试冻结 dynamics 的部分层（待后续实验）
+        # Stage 2: 训练actor（policy函数）- RL+BC混合方案
+        # BC部分：模仿专家动作（安全、稳定）
+        # RL部分：基于价值评估优化策略（允许改进）
         state_t = state_0
         option_t = option_prev
 
@@ -254,6 +252,11 @@ class TransformerPlanningModel(nn.Module):
         policy_action_logprob_list_bbf = []
         policy_action_logprob_list_rftn = []
         policy_reward_list = []
+        
+        # RL+BC新增：用于计算RL loss的信息
+        rl_action_target_list_bbf = []  # RL目标动作（可能是专家动作或更优动作）
+        rl_action_target_list_rftn = []
+        rl_weight_list = []  # 每步RL loss的权重
 
         for i in range(pre_len):
             policy_t, value_t = self.prediction(torch.reshape(state_t, (state_t.shape[0], -1)))
@@ -262,25 +265,92 @@ class TransformerPlanningModel(nn.Module):
             dist_bbf = torch.distributions.Categorical(logits=policy_t[0])  # (B, n_action)
             dist_rftn = torch.distributions.Categorical(logits=policy_t[1])
             dist = (dist_bbf, dist_rftn)
-
-            # 根据训练模式选择动作，决定 rollout 用哪个动作推进 dynamics
-            if sample_train:  # 随机采样
-                action_t_pred = (dist[0].sample(), dist[1].sample())  # (B, )
-                action_t_logprob = (dist[0].log_prob(action_t_pred[0]), dist[1].log_prob(action_t_pred[1]))  # 取对数概率
-            else:  # 贪婪选择
-                action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))
-                action_t_logprob = (dist[0].log_prob(action_t_pred[0]), dist[1].log_prob(action_t_pred[1]))
             
-            action_t_pred = (action_t_pred[0].unsqueeze(-1), action_t_pred[1].unsqueeze(-1))  # (B, 1)
+            # 获取真实专家动作
+            action_expert_bbf = action_t[0][:, i]  # (B,)
+            action_expert_rftn = action_t[1][:, i]
+            
+            # RL+BC混合：评估专家动作vs模型预测动作
+            if use_rl_bc_hybrid:
+                # 预测动作（贪婪或采样）
+                if sample_train:
+                    action_t_pred = (dist[0].sample(), dist[1].sample())
+                else:
+                    action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))
+                
+                # 评估专家动作的价值
+                action_expert_tensor = self._construct_action_tensor(
+                    (action_expert_bbf, action_expert_rftn), action_prev
+                )
+                option_now_expert = torch.zeros_like(option_prev)
+                option_now_expert[:, 0] = option_t[:, i]
+                
+                _, reward_expert = self.dynamics(
+                    state_t, action_expert_tensor, option_now_expert,
+                    padding_mask=padding_mask, state_0=state_0, offset=1+i
+                )
+                # Q值近似：reward + gamma * value
+                Q_expert = reward_expert + gamma * value_t
+                
+                # 评估预测动作的价值
+                action_pred_tensor = self._construct_action_tensor(
+                    action_t_pred, action_prev
+                )
+                _, reward_pred = self.dynamics(
+                    state_t, action_pred_tensor, option_now_expert,
+                    padding_mask=padding_mask, state_0=state_0, offset=1+i
+                )
+                Q_pred = reward_pred + gamma * value_t
+                
+                # 如果预测动作显著更好，将其作为RL目标
+                # 否则，仍然用专家动作
+                with torch.no_grad():
+                    use_pred_action = (Q_pred > Q_expert + 0.1).squeeze(-1)  # margin=0.1确保显著更好
+                
+                rl_action_bbf = torch.where(use_pred_action, action_t_pred[0], action_expert_bbf)
+                rl_action_rftn = torch.where(use_pred_action, action_t_pred[1], action_expert_rftn)
+                rl_weight = use_pred_action.float()  # 只在找到更好动作时施加RL loss
+                
+                # Rollout动作选择
+                if teacher_forcing:
+                    # 用专家动作rollout（更稳定）
+                    action_for_rollout = (action_expert_bbf, action_expert_rftn)
+                else:
+                    # 用混合动作rollout
+                    action_for_rollout = (rl_action_bbf, rl_action_rftn)
+            else:
+                # 原始方案：只用预测动作
+                if sample_train:
+                    action_t_pred = (dist[0].sample(), dist[1].sample())
+                else:
+                    action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))
+                
+                action_for_rollout = action_t_pred
+                rl_action_bbf = action_expert_bbf  # fallback to BC
+                rl_action_rftn = action_expert_rftn
+                rl_weight = torch.zeros_like(action_expert_bbf).float()
+            
+            # 构造rollout动作张量
+            action_t_pred = (action_for_rollout[0].unsqueeze(-1), action_for_rollout[1].unsqueeze(-1))
             action_now = (torch.zeros_like(action_prev[0]), torch.zeros_like(action_prev[1]))
-            action_now[0][:,0] = action_t_pred[0][:,0]
-            action_now[1][:,0] = action_t_pred[1][:,0]
+            action_now[0][:, 0] = action_t_pred[0][:, 0]
+            action_now[1][:, 0] = action_t_pred[1][:, 0]
             option_now = torch.zeros_like(option_prev)
-            option_now[:,0] = option_t[:,i+max_lenth-pre_len]
-            # action_now 不参与反向传播，只在 Stage 2 作为 dynamics 的输入，action 的loss是分布的CE
-            state_t_next_pred, reward_t_pred = self.dynamics(state_t, action_now, option_t, padding_mask=padding_mask, state_0=state_0, offset=1+i)
+            option_now[:, 0] = option_t[:, i]
+            
+            # Dynamics推进
+            state_t_next_pred, reward_t_pred = self.dynamics(
+                state_t, action_now, option_now,
+                padding_mask=padding_mask, state_0=state_0, offset=1+i
+            )
+            
+            # 计算log prob
+            action_t_logprob = (
+                dist[0].log_prob(action_for_rollout[0]),
+                dist[1].log_prob(action_for_rollout[1])
+            )
 
-            # 这两组一样
+            # 收集结果
             policy_train_list_bbf += [policy_t[0]]
             policy_train_list_rftn += [policy_t[1]]
             policy_list_bbf += [policy_t[0]]
@@ -290,6 +360,12 @@ class TransformerPlanningModel(nn.Module):
             policy_action_logprob_list_rftn += [action_t_logprob[1]]
             
             policy_reward_list += [reward_t_pred.detach()] 
+            
+            # RL+BC新增
+            rl_action_target_list_bbf += [rl_action_bbf]
+            rl_action_target_list_rftn += [rl_action_rftn]
+            rl_weight_list += [rl_weight]
+            
             state_t = state_t_next_pred
 
         # 计算贴现回报
@@ -318,6 +394,11 @@ class TransformerPlanningModel(nn.Module):
         
         policy_reward = torch.stack(policy_reward_list, dim=1)
         policy_return = torch.stack(policy_return_list, dim=1)
+        
+        # RL+BC新增输出
+        rl_action_target_bbf = torch.stack(rl_action_target_list_bbf, dim=1)  # (B, pre_len)
+        rl_action_target_rftn = torch.stack(rl_action_target_list_rftn, dim=1)
+        rl_weights = torch.stack(rl_weight_list, dim=1)  # (B, pre_len)
 
         outputs = {
             # 'state': state,  # 没有用到
@@ -330,9 +411,30 @@ class TransformerPlanningModel(nn.Module):
             'policy_action_logprob': (policy_action_logprob_bbf, policy_action_logprob_rftn),
             'policy_reward': policy_reward,
             'policy_return': policy_return,
+            # RL+BC新增
+            'rl_action_target': (rl_action_target_bbf, rl_action_target_rftn),
+            'rl_weights': rl_weights,
         }
 
         return outputs
+    
+    def _construct_action_tensor(self, action, action_prev):
+        """
+        辅助函数：构造动作张量用于dynamics
+        
+        Args:
+            action: (action_bbf, action_rftn)，每个是(B,)
+            action_prev: 之前的动作模板 (B, L)
+            
+        Returns:
+            (action_bbf_tensor, action_rftn_tensor)，每个是(B, L)，只有第0位是当前动作
+        """
+        action_bbf, action_rftn = action
+        action_now_bbf = torch.zeros_like(action_prev[0])
+        action_now_rftn = torch.zeros_like(action_prev[1])
+        action_now_bbf[:, 0] = action_bbf
+        action_now_rftn[:, 0] = action_rftn
+        return (action_now_bbf, action_now_rftn)
 
     # # not used
     # @torch.jit.export

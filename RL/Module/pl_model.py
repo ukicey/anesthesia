@@ -37,11 +37,11 @@ class BaseModule(pl.LightningModule):
             'loss_bis': torchmetrics.MeanMetric(),
             'loss_rp': torchmetrics.MeanMetric(),
             'loss_action': torchmetrics.MeanMetric(),
+            'loss_bc': torchmetrics.MeanMetric(),  # BC损失
+            'loss_rl': torchmetrics.MeanMetric(),  # RL损失
 
             'loss_value': torchmetrics.MeanMetric(),
             'loss_reward': torchmetrics.MeanMetric(),
-
-            'loss_rl': torchmetrics.MeanMetric(),
 
             'action_mae': torchmetrics.MeanMetric(),
             'value_mae': torchmetrics.MeanMetric(),
@@ -182,16 +182,36 @@ class RLSLModelModule(BaseModule):
         step_mask = torch.stack(step_masks)  # [n_step, len]
         step_mask = step_mask[None, ...].expand(b, n_step, length)  # (b, n, l) 斜方一半掩盖
         step_mask = step_mask.bool()
-        # action function
+        # action function - BC loss（行为克隆，模仿专家）
         pred_action_bbf = pred_policy[0]
         pred_action_train_bbf = pred_policy_train[0]
-        loss_action_bbf,true_action_bbf=cross_entropy(pred_action_train_bbf,action[0])
+        loss_bc_bbf, true_action_bbf = cross_entropy(pred_action_train_bbf, action[0])
         
         pred_action_rftn = pred_policy[1]
         pred_action_train_rftn = pred_policy_train[1]
-        loss_action_rftn,true_action_rftn=cross_entropy(pred_action_train_rftn,action[1])
+        loss_bc_rftn, true_action_rftn = cross_entropy(pred_action_train_rftn, action[1])
         
-        loss_action = loss_action_bbf + loss_action_rftn
+        loss_bc = loss_bc_bbf + loss_bc_rftn  # BC总损失
+        
+        # RL loss（策略优化，允许改进）
+        if use_rl_bc_hybrid and 'rl_action_target' in pred_data:
+            rl_action_target = pred_data['rl_action_target']  # (bbf, rftn)
+            rl_weights = pred_data['rl_weights']  # (B, pre_len)
+            
+            # 计算RL动作的交叉熵
+            loss_rl_bbf, _ = cross_entropy(pred_action_train_bbf, rl_action_target[0])
+            loss_rl_rftn, _ = cross_entropy(pred_action_train_rftn, rl_action_target[1])
+            
+            # 加权RL loss（只在找到更好动作时计入）
+            # rl_weights: (B, pre_len)，需要扩展到匹配loss shape
+            rl_weights_expanded = rl_weights.unsqueeze(-1)  # (B, pre_len, 1)
+            loss_rl = (loss_rl_bbf * rl_weights_expanded).mean() + (loss_rl_rftn * rl_weights_expanded).mean()
+            
+            # 混合损失
+            loss_action = lambda_bc * loss_bc + lambda_rl * loss_rl
+        else:
+            loss_rl = torch.tensor(0.0, device=device)
+            loss_action = loss_bc
         
         if not self.loss_joint:
             loss_reward = 0
@@ -245,6 +265,8 @@ class RLSLModelModule(BaseModule):
 
             'loss': loss,
             'loss_action': loss_action,
+            'loss_bc': loss_bc,  # BC损失
+            'loss_rl': loss_rl,  # RL损失
             'loss_value': loss_value,
             'loss_reward': loss_reward,
             'loss_rp': loss_rp,
@@ -336,6 +358,8 @@ class RLSLModelModule(BaseModule):
 
         name_to_value = {
             'loss_action': losses['loss_action'],
+            'loss_bc': losses['loss_bc'],  # BC损失
+            'loss_rl': losses['loss_rl'],  # RL损失
             'loss_value': losses['loss_value'],
             'loss_reward': losses['loss_reward'],
             'loss_bis': losses['loss_bis'],
@@ -346,8 +370,6 @@ class RLSLModelModule(BaseModule):
             'bis_mae': bis_mae,
             'rp_mae': rp_mae,
         }
-        if 'loss_rl' in losses:
-            name_to_value['loss_rl'] = losses['loss_rl']
 
         for metrics_name, value in name_to_value.items():
             metrics = self.metrics[metrics_name]
