@@ -38,7 +38,7 @@ class BaseModule(pl.LightningModule):
             'loss_rp': torchmetrics.MeanMetric(),
             'loss_action': torchmetrics.MeanMetric(),
             'loss_bc': torchmetrics.MeanMetric(),  # BC损失
-            'loss_rl': torchmetrics.MeanMetric(),  # RL损失
+            'loss_mcts': torchmetrics.MeanMetric(),  # MCTS损失
 
             'loss_value': torchmetrics.MeanMetric(),
             'loss_reward': torchmetrics.MeanMetric(),
@@ -193,24 +193,24 @@ class RLSLModelModule(BaseModule):
         
         loss_bc = loss_bc_bbf + loss_bc_rftn  # BC总损失
         
-        # RL loss（策略优化，允许改进）
-        if use_rl_bc_hybrid and 'rl_action_target' in pred_data:
-            rl_action_target = pred_data['rl_action_target']  # (bbf, rftn)
-            rl_weights = pred_data['rl_weights']  # (B, pre_len)
+        # MCTS loss（学习MCTS搜索找到的高价值动作）
+        if use_mcts and 'mcts_action_target' in pred_data:
+            mcts_action_target = pred_data['mcts_action_target']  # (bbf, rftn)
+            mcts_weights = pred_data['mcts_weights']  # (B, pre_len)
             
-            # 计算RL动作的交叉熵
-            loss_rl_bbf, _ = cross_entropy(pred_action_train_bbf, rl_action_target[0])
-            loss_rl_rftn, _ = cross_entropy(pred_action_train_rftn, rl_action_target[1])
+            # 计算MCTS动作的交叉熵
+            loss_mcts_bbf, _ = cross_entropy(pred_action_train_bbf, mcts_action_target[0])
+            loss_mcts_rftn, _ = cross_entropy(pred_action_train_rftn, mcts_action_target[1])
             
-            # 加权RL loss（只在找到更好动作时计入）
-            # rl_weights: (B, pre_len)，需要扩展到匹配loss shape
-            rl_weights_expanded = rl_weights.unsqueeze(-1)  # (B, pre_len, 1)
-            loss_rl = (loss_rl_bbf * rl_weights_expanded).mean() + (loss_rl_rftn * rl_weights_expanded).mean()
+            # 加权MCTS loss（只在MCTS找到更好动作时计入）
+            # mcts_weights: (B, pre_len)，需要扩展到匹配loss shape
+            mcts_weights_expanded = mcts_weights.unsqueeze(-1)  # (B, pre_len, 1)
+            loss_mcts = (loss_mcts_bbf * mcts_weights_expanded).mean() + (loss_mcts_rftn * mcts_weights_expanded).mean()
             
-            # 混合损失
-            loss_action = lambda_bc * loss_bc + lambda_rl * loss_rl
+            # 混合损失：BC + MCTS
+            loss_action = lambda_bc * loss_bc + lambda_mcts * loss_mcts
         else:
-            loss_rl = torch.tensor(0.0, device=device)
+            loss_mcts = torch.tensor(0.0, device=device)
             loss_action = loss_bc
         
         if not self.loss_joint:
@@ -266,7 +266,7 @@ class RLSLModelModule(BaseModule):
             'loss': loss,
             'loss_action': loss_action,
             'loss_bc': loss_bc,  # BC损失
-            'loss_rl': loss_rl,  # RL损失
+            'loss_mcts': loss_mcts,  # MCTS损失
             'loss_value': loss_value,
             'loss_reward': loss_reward,
             'loss_rp': loss_rp,
@@ -359,7 +359,7 @@ class RLSLModelModule(BaseModule):
         name_to_value = {
             'loss_action': losses['loss_action'],
             'loss_bc': losses['loss_bc'],  # BC损失
-            'loss_rl': losses['loss_rl'],  # RL损失
+            'loss_mcts': losses['loss_mcts'],  # MCTS损失
             'loss_value': losses['loss_value'],
             'loss_reward': losses['loss_reward'],
             'loss_bis': losses['loss_bis'],

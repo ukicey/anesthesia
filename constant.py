@@ -61,11 +61,18 @@ val_rate=1
 
 model_val=1
 
-# RL+BC混合训练配置
-use_rl_bc_hybrid = True  # 是否使用RL+BC混合训练
-lambda_bc = 0.7  # BC损失权重
-lambda_rl = 0.3  # RL损失权重
+# BC+MCTS混合训练配置
+use_mcts = True  # 是否使用MCTS搜索
+lambda_bc = 0.7  # BC损失权重（模仿专家）
+lambda_mcts = 0.3  # MCTS损失权重（学习MCTS找到的高价值动作）
+teacher_forcing = True  # Stage 2是否使用专家动作rollout（推荐True，更稳定）
+
+# MCTS搜索参数
+mcts_simulations = 50  # MCTS每次搜索的模拟次数
+mcts_c_puct = 1.0  # MCTS的探索常数（UCB）
+use_mcts_margin = 0.1  # MCTS动作需要比专家好多少才使用（margin）
+
+# 其他选项（预留）
 use_scheduled_sampling = False  # 是否使用scheduled sampling
 scheduled_sampling_decay = 0.01  # scheduled sampling的衰减率（每epoch）
-teacher_forcing = True  # Stage 2是否使用真实动作rollout（更稳定）
 
