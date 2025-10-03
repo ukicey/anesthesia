@@ -61,3 +61,8 @@ val_rate=1
 
 model_val=1
 
+# MCTS 配置
+use_mcts = False  # 是否在 Stage 2 使用 MCTS
+mcts_simulations = 20  # MCTS 模拟次数（越大越慢但越准确）
+mcts_c_puct = 1.0  # UCB 探索常数
+

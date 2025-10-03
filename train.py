@@ -43,6 +43,8 @@ def get_model(data_module=None):
         'n_reward_max': n_reward_max,
         'n_value_max': n_value_max,
         'n_aux': n_aux,
+        'use_mcts': use_mcts,
+        'mcts_simulations': mcts_simulations,
     })
 
     model = TransformerPlanningModel(**model_kargs_ori)

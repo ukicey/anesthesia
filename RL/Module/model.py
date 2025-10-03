@@ -6,13 +6,21 @@ import torch.nn as nn
 from RL.baseline import TransformerCausalEncoder, MLP, TransformerCausalDecoder
 from constant import *
 
+# MCTS 相关导入（可选）
+try:
+    from RL.mcts import MCTS, SimplifiedMCTS
+    MCTS_AVAILABLE = True
+except ImportError:
+    MCTS_AVAILABLE = False
+
 
 class TransformerPlanningModel(nn.Module):
     """
     A model with (1) representation, (2) prediction, (3) dynamics functions
     Paper: https://www.nature.com/articles/s41591-023-02552-9
     """
-    def __init__(self, n_action, n_option, n_reward_max, n_value_max, max_lenth, n_aux, n_input,):
+    def __init__(self, n_action, n_option, n_reward_max, n_value_max, max_lenth, n_aux, n_input,
+                 use_mcts=False, mcts_simulations=20):
         super().__init__()
         self.model_type = 'Transformer'
         self.n_action = n_action  # 201
@@ -29,6 +37,16 @@ class TransformerPlanningModel(nn.Module):
         self.n_reward_size = n_reward_max * 2 + 1
         self.n_value_size = n_value_max * 2 + 1
         self.n_aux = n_aux
+        
+        # MCTS 配置
+        self.use_mcts = use_mcts and MCTS_AVAILABLE
+        if self.use_mcts:
+            self.mcts = SimplifiedMCTS(
+                model=self,
+                n_simulations=mcts_simulations,
+                c_puct=1.0,
+                gamma=gamma
+            )
 
         # 输入：state | action | action | option
         # 其中 action 做了嵌入，维度为 n_hidden（必要性存疑，因为 action 本身就是离散有序的）
@@ -264,7 +282,32 @@ class TransformerPlanningModel(nn.Module):
             dist = (dist_bbf, dist_rftn)
 
             # 根据训练模式选择动作，决定 rollout 用哪个动作推进 dynamics
-            if sample_train:  # 随机采样
+            if self.use_mcts and not sample_train:
+                # 使用 MCTS 选择动作
+                action_t_pred_list = []
+                for b in range(state_t.shape[0]):  # 对 batch 中每个样本单独搜索
+                    state_t_single = state_t[b:b+1]
+                    state_0_single = state_0[b:b+1]
+                    action_prev_single = (action_prev[0][b:b+1], action_prev[1][b:b+1])
+                    option_t_single = option_t[b:b+1]
+                    padding_mask_single = padding_mask[b:b+1] if padding_mask is not None else None
+                    
+                    action_mcts = self.mcts.search_sequential(
+                        state_0_single, state_t_single, action_prev_single, option_t_single,
+                        padding_mask=padding_mask_single, offset=1+i
+                    )
+                    action_t_pred_list.append(action_mcts)
+                
+                # 组合 batch
+                action_bbf_batch = torch.tensor([a[0] for a in action_t_pred_list], 
+                                                device=state_t.device)
+                action_rftn_batch = torch.tensor([a[1] for a in action_t_pred_list], 
+                                                 device=state_t.device)
+                action_t_pred = (action_bbf_batch, action_rftn_batch)
+                action_t_logprob = (dist[0].log_prob(action_t_pred[0]), 
+                                   dist[1].log_prob(action_t_pred[1]))
+                
+            elif sample_train:  # 随机采样
                 action_t_pred = (dist[0].sample(), dist[1].sample())  # (B, )
                 action_t_logprob = (dist[0].log_prob(action_t_pred[0]), dist[1].log_prob(action_t_pred[1]))  # 取对数概率
             else:  # 贪婪选择
