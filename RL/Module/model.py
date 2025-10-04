@@ -332,29 +332,33 @@ class TransformerPlanningModel(nn.Module):
                     
                     # 对每个样本评估MCTS vs 专家
                     for b in range(batch_size):
-                        # 评估MCTS动作
+                        # 评估MCTS动作：Q(s,a) = r(s,a) + γ*V(s')
                         action_mcts_tensor = self._construct_action_tensor(
                             (actions_mcts_bbf[b].item(), actions_mcts_rftn[b].item()), 
                             (action_prev[0][b:b+1], action_prev[1][b:b+1])
                         )
-                        _, reward_mcts = self.dynamics(
+                        state_next_mcts, reward_mcts = self.dynamics(
                             state_t[b:b+1], action_mcts_tensor, option_now[b:b+1],
                             padding_mask=padding_mask[b:b+1] if padding_mask is not None else None,
                             state_0=state_0[b:b+1], offset=1+i
                         )
-                        Q_mcts = reward_mcts + gamma * value_t[b:b+1]
+                        # 计算下一状态的价值 V(s')
+                        _, value_next_mcts = self.prediction(torch.reshape(state_next_mcts, (state_next_mcts.shape[0], -1)))
+                        Q_mcts = reward_mcts + gamma * value_next_mcts
                         
-                        # 评估专家动作
+                        # 评估专家动作：Q(s,a) = r(s,a) + γ*V(s')
                         action_expert_tensor = self._construct_action_tensor(
                             (action_expert_bbf[b].item(), action_expert_rftn[b].item()),
                             (action_prev[0][b:b+1], action_prev[1][b:b+1])
                         )
-                        _, reward_expert = self.dynamics(
+                        state_next_expert, reward_expert = self.dynamics(
                             state_t[b:b+1], action_expert_tensor, option_now[b:b+1],
                             padding_mask=padding_mask[b:b+1] if padding_mask is not None else None,
                             state_0=state_0[b:b+1], offset=1+i
                         )
-                        Q_expert = reward_expert + gamma * value_t[b:b+1]
+                        # 计算下一状态的价值 V(s')
+                        _, value_next_expert = self.prediction(torch.reshape(state_next_expert, (state_next_expert.shape[0], -1)))
+                        Q_expert = reward_expert + gamma * value_next_expert
                         
                         # 如果MCTS找到更好的动作
                         if Q_mcts.item() > Q_expert.item() + use_mcts_margin:
