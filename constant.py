@@ -63,24 +63,25 @@ model_val=1
 
 # BC+MCTS混合训练配置
 use_mcts = True  # 是否使用MCTS搜索
-lambda_bc = 0.7  # BC损失权重（模仿专家）
-lambda_mcts = 0.3  # MCTS损失权重（学习MCTS找到的高价值动作）
-teacher_forcing = True  # Stage 2是否使用专家动作rollout（推荐True，更稳定）
+lambda_bc = 0.7  # BC损失权重
+lambda_mcts = 0.3  # MCTS损失权重
+teacher_forcing = False  # True=专家动作，False=MCTS动作
 
 # MCTS搜索参数
 mcts_simulations = 50  # MCTS每次搜索的模拟次数
 mcts_c_puct = 1.0  # MCTS的探索常数（UCB）
 use_mcts_margin = 0.1  # MCTS动作需要比专家好多少才使用（margin）
 
-# 批量MCTS配置
-use_mcts_batch_search = False  # True=对所有样本MCTS（慢但完整），False=只对部分样本（快）
+# 快速MCTS配置
+use_mcts_batch_search = True  # True=对所有样本MCTS（慢但完整），False=只对部分样本（快）
 mcts_batch_samples = 32  # 快速模式下，每个batch最多对多少样本执行MCTS
 
-# 训练策略配置
-warmup_epochs = 10  # 前N个epoch只训练环境模型，不训练policy
-env_loss_weight = 2.0  # warmup后，环境模型loss的权重（相对policy）
+# 暖机配置
+warmup_epochs = 50  # 暖机轮数
+env_loss_weight = 1.5  # warmup后，环境模型loss的权重（相对policy）
 
 # 其他选项（预留）
 use_scheduled_sampling = False  # 是否使用scheduled sampling
 scheduled_sampling_decay = 0.01  # scheduled sampling的衰减率（每epoch）
+
 
