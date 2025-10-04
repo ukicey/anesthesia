@@ -37,11 +37,11 @@ class BaseModule(pl.LightningModule):
             'loss_bis': torchmetrics.MeanMetric(),
             'loss_rp': torchmetrics.MeanMetric(),
             'loss_action': torchmetrics.MeanMetric(),
+            'loss_bc': torchmetrics.MeanMetric(),  # BC损失
+            'loss_mcts': torchmetrics.MeanMetric(),  # MCTS损失
 
             'loss_value': torchmetrics.MeanMetric(),
             'loss_reward': torchmetrics.MeanMetric(),
-
-            'loss_rl': torchmetrics.MeanMetric(),
 
             'action_mae': torchmetrics.MeanMetric(),
             'value_mae': torchmetrics.MeanMetric(),
@@ -133,6 +133,10 @@ class RLSLModelModule(BaseModule):
         self.loss_state_weight = self.module_args.get('loss_state_weight', 0.1)
         self.loss_rl_weight = self.module_args.get('loss_rl_weight', 1.0)
         self.loss_joint = self.module_args.get('loss_rl_joint', True)
+        
+        # 训练策略配置
+        self.warmup_epochs = warmup_epochs
+        self.env_loss_weight = env_loss_weight
 
     def forward(self, x):
         """
@@ -182,16 +186,36 @@ class RLSLModelModule(BaseModule):
         step_mask = torch.stack(step_masks)  # [n_step, len]
         step_mask = step_mask[None, ...].expand(b, n_step, length)  # (b, n, l) 斜方一半掩盖
         step_mask = step_mask.bool()
-        # action function
+        # action function - BC loss（行为克隆，模仿专家）
         pred_action_bbf = pred_policy[0]
         pred_action_train_bbf = pred_policy_train[0]
-        loss_action_bbf,true_action_bbf=cross_entropy(pred_action_train_bbf,action[0])
+        loss_bc_bbf, true_action_bbf = cross_entropy(pred_action_train_bbf, action[0])
         
         pred_action_rftn = pred_policy[1]
         pred_action_train_rftn = pred_policy_train[1]
-        loss_action_rftn,true_action_rftn=cross_entropy(pred_action_train_rftn,action[1])
+        loss_bc_rftn, true_action_rftn = cross_entropy(pred_action_train_rftn, action[1])
         
-        loss_action = loss_action_bbf + loss_action_rftn
+        loss_bc = loss_bc_bbf + loss_bc_rftn  # BC总损失
+        
+        # MCTS loss（学习MCTS搜索找到的高价值动作）
+        if use_mcts and 'mcts_action_target' in pred_data:
+            mcts_action_target = pred_data['mcts_action_target']  # (bbf, rftn)
+            mcts_weights = pred_data['mcts_weights']  # (B, pre_len)
+            
+            # 计算MCTS动作的交叉熵
+            loss_mcts_bbf, _ = cross_entropy(pred_action_train_bbf, mcts_action_target[0])
+            loss_mcts_rftn, _ = cross_entropy(pred_action_train_rftn, mcts_action_target[1])
+            
+            # 加权MCTS loss（只在MCTS找到更好动作时计入）
+            # mcts_weights: (B, pre_len)，需要扩展到匹配loss shape
+            mcts_weights_expanded = mcts_weights.unsqueeze(-1)  # (B, pre_len, 1)
+            loss_mcts = (loss_mcts_bbf * mcts_weights_expanded).mean() + (loss_mcts_rftn * mcts_weights_expanded).mean()
+            
+            # 混合损失：BC + MCTS
+            loss_action = lambda_bc * loss_bc + lambda_mcts * loss_mcts
+        else:
+            loss_mcts = torch.tensor(0.0, device=device)
+            loss_action = loss_bc
         
         if not self.loss_joint:
             loss_reward = 0
@@ -223,15 +247,26 @@ class RLSLModelModule(BaseModule):
             loss_rp,true_rp = cross_entropy(pred_rp, rp_target)
             #loss_rp = masked_loss(F.mse_loss, pred_rp.squeeze(-1), rp_target, mask=None)
 
-           
-
-            loss =loss_action +loss_bis+loss_rp +loss_value + loss_reward 
+            # 训练策略：Warm-up + 加权
+            loss_env = loss_bis + loss_rp + loss_value + loss_reward
+            
+            if self.current_epoch < self.warmup_epochs:
+                # Phase 1: Warm-up阶段，只训练环境模型
+                loss = loss_env
+                # 记录：warmup阶段不训练policy
+                in_warmup = True
+            else:
+                # Phase 2: 联合训练，但环境模型loss权重更大
+                loss = loss_action + self.env_loss_weight * loss_env
+                in_warmup = False
+            
             # 计算并打印各个损失及其加权总和
             # print("Action:", str(loss_action) +
             #   " Rp:", str(loss_rp) +
             #   " Bis:", str(loss_bis) +
             #   " Value:", str(loss_value) +
-            #   " Reward:", str(loss_reward))
+            #   " Reward:", str(loss_reward) +
+            #   " Warmup:", str(in_warmup))
 
         losses = {
             '_step_mask': step_mask,
@@ -245,6 +280,8 @@ class RLSLModelModule(BaseModule):
 
             'loss': loss,
             'loss_action': loss_action,
+            'loss_bc': loss_bc,  # BC损失
+            'loss_mcts': loss_mcts,  # MCTS损失
             'loss_value': loss_value,
             'loss_reward': loss_reward,
             'loss_rp': loss_rp,
@@ -279,6 +316,10 @@ class RLSLModelModule(BaseModule):
             self.train_loss = 0
         self.log("train_loss", self.train_loss, prog_bar=False, sync_dist=True)
         self.log("val_loss", loss, prog_bar=False, sync_dist=True)
+        
+        # 记录是否在warmup阶段
+        in_warmup = self.current_epoch < self.warmup_epochs
+        self.log("in_warmup", float(in_warmup), prog_bar=True, sync_dist=True)
 
         action = label_data['action']
 
@@ -336,6 +377,8 @@ class RLSLModelModule(BaseModule):
 
         name_to_value = {
             'loss_action': losses['loss_action'],
+            'loss_bc': losses['loss_bc'],  # BC损失
+            'loss_mcts': losses['loss_mcts'],  # MCTS损失
             'loss_value': losses['loss_value'],
             'loss_reward': losses['loss_reward'],
             'loss_bis': losses['loss_bis'],
@@ -346,8 +389,6 @@ class RLSLModelModule(BaseModule):
             'bis_mae': bis_mae,
             'rp_mae': rp_mae,
         }
-        if 'loss_rl' in losses:
-            name_to_value['loss_rl'] = losses['loss_rl']
 
         for metrics_name, value in name_to_value.items():
             metrics = self.metrics[metrics_name]

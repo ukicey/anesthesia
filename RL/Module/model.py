@@ -6,13 +6,24 @@ import torch.nn as nn
 from RL.baseline import TransformerCausalEncoder, MLP, TransformerCausalDecoder
 from constant import *
 
+# 懒加载MCTS，避免循环导入
+_mcts_module = None
+
+def get_mcts():
+    global _mcts_module
+    if _mcts_module is None:
+        from RL.mcts import MCTS
+        _mcts_module = MCTS
+    return _mcts_module
+
 
 class TransformerPlanningModel(nn.Module):
     """
     A model with (1) representation, (2) prediction, (3) dynamics functions
     Paper: https://www.nature.com/articles/s41591-023-02552-9
     """
-    def __init__(self, n_action, n_option, n_reward_max, n_value_max, max_lenth, n_aux, n_input,):
+    def __init__(self, n_action, n_option, n_reward_max, n_value_max, max_lenth, n_aux, n_input,
+                 use_mcts=False, mcts_simulations=50, mcts_c_puct=1.0):
         super().__init__()
         self.model_type = 'Transformer'
         self.n_action = n_action  # 201
@@ -29,6 +40,18 @@ class TransformerPlanningModel(nn.Module):
         self.n_reward_size = n_reward_max * 2 + 1
         self.n_value_size = n_value_max * 2 + 1
         self.n_aux = n_aux
+        
+        # MCTS配置
+        self.use_mcts = use_mcts
+        self.mcts = None
+        if use_mcts:
+            MCTS = get_mcts()
+            self.mcts = MCTS(
+                model=self,
+                n_simulations=mcts_simulations,
+                c_puct=mcts_c_puct,
+                gamma=gamma
+            )
 
         # 输入：state | action | action | option
         # 其中 action 做了嵌入，维度为 n_hidden（必要性存疑，因为 action 本身就是离散有序的）
@@ -239,11 +262,9 @@ class TransformerPlanningModel(nn.Module):
             state_t = state_t_next
 
 
-        # Stage 2: 训练actor（policy函数），用Stage 1得到的环境模型 rollout
-        # 在这里 dynamics 模块本身因 state 传递到策略 logits（参与行为克隆交叉熵）会被反向更新
-        # dynamics 可能学到“对预测动作更友好”而非真实转移，削弱模拟准确性，出现 model exploitation
-        # 训练目标混杂：dynamics 同时最小化奖励/生命体征监督 + 行为克隆的隐式表征约束，可能导致表示折中。
-        # 可尝试冻结 dynamics 的部分层（待后续实验）
+        # Stage 2: 训练actor（policy函数）- BC + MCTS混合方案
+        # BC部分：模仿专家动作（安全、稳定）
+        # MCTS部分：学习MCTS搜索找到的高价值动作（优化策略）
         state_t = state_0
         option_t = option_prev
 
@@ -254,6 +275,11 @@ class TransformerPlanningModel(nn.Module):
         policy_action_logprob_list_bbf = []
         policy_action_logprob_list_rftn = []
         policy_reward_list = []
+        
+        # MCTS新增：用于计算MCTS guided loss的信息
+        mcts_action_target_list_bbf = []  # MCTS找到的目标动作
+        mcts_action_target_list_rftn = []
+        mcts_weight_list = []  # 每步MCTS loss的权重（MCTS置信度）
 
         for i in range(pre_len):
             policy_t, value_t = self.prediction(torch.reshape(state_t, (state_t.shape[0], -1)))
@@ -262,25 +288,133 @@ class TransformerPlanningModel(nn.Module):
             dist_bbf = torch.distributions.Categorical(logits=policy_t[0])  # (B, n_action)
             dist_rftn = torch.distributions.Categorical(logits=policy_t[1])
             dist = (dist_bbf, dist_rftn)
-
-            # 根据训练模式选择动作，决定 rollout 用哪个动作推进 dynamics
-            if sample_train:  # 随机采样
-                action_t_pred = (dist[0].sample(), dist[1].sample())  # (B, )
-                action_t_logprob = (dist[0].log_prob(action_t_pred[0]), dist[1].log_prob(action_t_pred[1]))  # 取对数概率
-            else:  # 贪婪选择
-                action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))
-                action_t_logprob = (dist[0].log_prob(action_t_pred[0]), dist[1].log_prob(action_t_pred[1]))
             
-            action_t_pred = (action_t_pred[0].unsqueeze(-1), action_t_pred[1].unsqueeze(-1))  # (B, 1)
-            action_now = (torch.zeros_like(action_prev[0]), torch.zeros_like(action_prev[1]))
-            action_now[0][:,0] = action_t_pred[0][:,0]
-            action_now[1][:,0] = action_t_pred[1][:,0]
+            # 获取真实专家动作
+            action_expert_bbf = action_t[0][:, i]  # (B,)
+            action_expert_rftn = action_t[1][:, i]
+            
+            # MCTS引导训练（批量版本）
+            if self.use_mcts and self.mcts is not None and self.training:
+                # 使用批量MCTS搜索
+                with torch.no_grad():
+                    # 批量搜索：对batch中所有样本执行MCTS
+                    # 可选：使用batch_search_fast(max_samples=32)只对部分样本搜索
+                    if use_mcts_batch_search:
+                        # 完整批量搜索
+                        actions_mcts_bbf, actions_mcts_rftn = self.mcts.batch_search(
+                            state_0=state_0,
+                            state_t=state_t,
+                            action_prev=action_prev,
+                            option_t=option_t,
+                            padding_mask=padding_mask,
+                            offset=1+i
+                        )
+                    else:
+                        # 快速模式：只对部分样本搜索
+                        actions_mcts_bbf, actions_mcts_rftn = self.mcts.batch_search_fast(
+                            state_0=state_0,
+                            state_t=state_t,
+                            action_prev=action_prev,
+                            option_t=option_t,
+                            padding_mask=padding_mask,
+                            offset=1+i,
+                            max_samples=mcts_batch_samples
+                        )
+                    
+                    # 评估MCTS动作的Q值（批量）
+                    batch_size = state_t.shape[0]
+                    mcts_action_bbf = torch.zeros(batch_size, dtype=torch.long, device=state_t.device)
+                    mcts_action_rftn = torch.zeros(batch_size, dtype=torch.long, device=state_t.device)
+                    mcts_weight = torch.zeros(batch_size, device=state_t.device)
+                    
+                    option_now = torch.zeros_like(option_prev)
+                    option_now[:, 0] = option_t[:, i]
+                    
+                    # 对每个样本评估MCTS vs 专家
+                    for b in range(batch_size):
+                        # 评估MCTS动作：Q(s,a) = r(s,a) + γ*V(s')
+                        action_mcts_tensor = self._construct_action_tensor(
+                            (actions_mcts_bbf[b].item(), actions_mcts_rftn[b].item()), 
+                            (action_prev[0][b:b+1], action_prev[1][b:b+1])
+                        )
+                        state_next_mcts, reward_mcts = self.dynamics(
+                            state_t[b:b+1], action_mcts_tensor, option_now[b:b+1],
+                            padding_mask=padding_mask[b:b+1] if padding_mask is not None else None,
+                            state_0=state_0[b:b+1], offset=1+i
+                        )
+                        # 计算下一状态的价值 V(s')
+                        _, value_next_mcts = self.prediction(torch.reshape(state_next_mcts, (state_next_mcts.shape[0], -1)))
+                        Q_mcts = reward_mcts + gamma * value_next_mcts
+                        
+                        # 评估专家动作：Q(s,a) = r(s,a) + γ*V(s')
+                        action_expert_tensor = self._construct_action_tensor(
+                            (action_expert_bbf[b].item(), action_expert_rftn[b].item()),
+                            (action_prev[0][b:b+1], action_prev[1][b:b+1])
+                        )
+                        state_next_expert, reward_expert = self.dynamics(
+                            state_t[b:b+1], action_expert_tensor, option_now[b:b+1],
+                            padding_mask=padding_mask[b:b+1] if padding_mask is not None else None,
+                            state_0=state_0[b:b+1], offset=1+i
+                        )
+                        # 计算下一状态的价值 V(s')
+                        _, value_next_expert = self.prediction(torch.reshape(state_next_expert, (state_next_expert.shape[0], -1)))
+                        Q_expert = reward_expert + gamma * value_next_expert
+                        
+                        # 如果MCTS找到更好的动作
+                        if Q_mcts.item() > Q_expert.item() + use_mcts_margin:
+                            mcts_action_bbf[b] = actions_mcts_bbf[b]
+                            mcts_action_rftn[b] = actions_mcts_rftn[b]
+                            mcts_weight[b] = 1.0
+                        else:
+                            mcts_action_bbf[b] = action_expert_bbf[b]
+                            mcts_action_rftn[b] = action_expert_rftn[b]
+                            mcts_weight[b] = 0.0
+                
+                # Rollout动作选择（batch维度）
+                if teacher_forcing:
+                    # 用专家动作rollout（更稳定，推荐）
+                    action_for_rollout_bbf = action_expert_bbf  # (B,)
+                    action_for_rollout_rftn = action_expert_rftn  # (B,)
+                else:
+                    # 用MCTS动作rollout（更激进）
+                    action_for_rollout_bbf = mcts_action_bbf  # (B,)
+                    action_for_rollout_rftn = mcts_action_rftn  # (B,)
+            else:
+                # 不使用MCTS：标准训练
+                if sample_train:
+                    action_t_pred = (dist[0].sample(), dist[1].sample())  # (B,)
+                else:
+                    action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))  # (B,)
+                
+                action_for_rollout_bbf = action_t_pred[0]  # (B,)
+                action_for_rollout_rftn = action_t_pred[1]  # (B,)
+                mcts_action_bbf = action_expert_bbf  # fallback to BC
+                mcts_action_rftn = action_expert_rftn
+                mcts_weight = torch.zeros(action_expert_bbf.shape[0], device=state_t.device)
+            
+            # 构造rollout动作张量（batch维度）
+            action_now_bbf = torch.zeros_like(action_prev[0])  # (B, L)
+            action_now_rftn = torch.zeros_like(action_prev[1])  # (B, L)
+            action_now_bbf[:, 0] = action_for_rollout_bbf  # (B,) -> (B, L)
+            action_now_rftn[:, 0] = action_for_rollout_rftn  # (B,)
+            action_now = (action_now_bbf, action_now_rftn)
+            
             option_now = torch.zeros_like(option_prev)
-            option_now[:,0] = option_t[:,i+max_lenth-pre_len]
-            # action_now 不参与反向传播，只在 Stage 2 作为 dynamics 的输入，action 的loss是分布的CE
-            state_t_next_pred, reward_t_pred = self.dynamics(state_t, action_now, option_t, padding_mask=padding_mask, state_0=state_0, offset=1+i)
+            option_now[:, 0] = option_t[:, i]
+            
+            # Dynamics推进（batch维度）
+            state_t_next_pred, reward_t_pred = self.dynamics(
+                state_t, action_now, option_now,
+                padding_mask=padding_mask, state_0=state_0, offset=1+i
+            )
+            
+            # 计算log prob（batch维度）
+            action_t_logprob = (
+                dist[0].log_prob(action_for_rollout_bbf),  # (B,)
+                dist[1].log_prob(action_for_rollout_rftn)  # (B,)
+            )
 
-            # 这两组一样
+            # 收集结果
             policy_train_list_bbf += [policy_t[0]]
             policy_train_list_rftn += [policy_t[1]]
             policy_list_bbf += [policy_t[0]]
@@ -290,6 +424,12 @@ class TransformerPlanningModel(nn.Module):
             policy_action_logprob_list_rftn += [action_t_logprob[1]]
             
             policy_reward_list += [reward_t_pred.detach()] 
+            
+            # MCTS新增
+            mcts_action_target_list_bbf += [mcts_action_bbf]
+            mcts_action_target_list_rftn += [mcts_action_rftn]
+            mcts_weight_list += [mcts_weight]
+            
             state_t = state_t_next_pred
 
         # 计算贴现回报
@@ -318,6 +458,11 @@ class TransformerPlanningModel(nn.Module):
         
         policy_reward = torch.stack(policy_reward_list, dim=1)
         policy_return = torch.stack(policy_return_list, dim=1)
+        
+        # MCTS新增输出
+        mcts_action_target_bbf = torch.stack(mcts_action_target_list_bbf, dim=1)  # (B, pre_len)
+        mcts_action_target_rftn = torch.stack(mcts_action_target_list_rftn, dim=1)
+        mcts_weights = torch.stack(mcts_weight_list, dim=1)  # (B, pre_len)
 
         outputs = {
             # 'state': state,  # 没有用到
@@ -330,9 +475,30 @@ class TransformerPlanningModel(nn.Module):
             'policy_action_logprob': (policy_action_logprob_bbf, policy_action_logprob_rftn),
             'policy_reward': policy_reward,
             'policy_return': policy_return,
+            # MCTS新增
+            'mcts_action_target': (mcts_action_target_bbf, mcts_action_target_rftn),
+            'mcts_weights': mcts_weights,
         }
 
         return outputs
+    
+    def _construct_action_tensor(self, action, action_prev):
+        """
+        辅助函数：构造动作张量用于dynamics
+        
+        Args:
+            action: (action_bbf, action_rftn)，每个是(B,)
+            action_prev: 之前的动作模板 (B, L)
+            
+        Returns:
+            (action_bbf_tensor, action_rftn_tensor)，每个是(B, L)，只有第0位是当前动作
+        """
+        action_bbf, action_rftn = action
+        action_now_bbf = torch.zeros_like(action_prev[0])
+        action_now_rftn = torch.zeros_like(action_prev[1])
+        action_now_bbf[:, 0] = action_bbf
+        action_now_rftn[:, 0] = action_rftn
+        return (action_now_bbf, action_now_rftn)
 
     # # not used
     # @torch.jit.export
