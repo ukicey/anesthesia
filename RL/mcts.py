@@ -149,13 +149,13 @@ class MCTS:
                padding_mask: Optional[torch.Tensor] = None,
                offset: int = 0) -> Tuple[int, int]:
         """
-        执行MCTS搜索，返回最优动作
+        执行MCTS搜索，返回最优动作（单样本版本）
         
         Args:
-            state_0: 初始真实观测状态 (B, L, n_hidden)
-            state_t: 当前状态 (B, L, n_hidden)
-            action_prev: 之前的动作模板 (B, L)
-            option_t: 当前option (B, L)
+            state_0: 初始真实观测状态 (B=1, L, n_hidden)
+            state_t: 当前状态 (B=1, L, n_hidden)
+            action_prev: 之前的动作模板 (B=1, L)
+            option_t: 当前option (B=1, L)
             padding_mask: 填充掩码
             offset: 时间偏移
             
@@ -174,6 +174,112 @@ class MCTS:
         # 选择访问次数最多的动作
         best_action = max(root.children.items(), key=lambda x: x[1].visit_count)[0]
         return best_action
+    
+    @torch.no_grad()
+    def batch_search(self,
+                     state_0: torch.Tensor,
+                     state_t: torch.Tensor,
+                     action_prev: Tuple[torch.Tensor, torch.Tensor],
+                     option_t: torch.Tensor,
+                     padding_mask: Optional[torch.Tensor] = None,
+                     offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        批量MCTS搜索（优化版）
+        
+        Args:
+            state_0: (B, L, n_hidden)
+            state_t: (B, L, n_hidden)
+            action_prev: 2 * (B, L)
+            option_t: (B, L)
+            
+        Returns:
+            actions_bbf: (B,) 每个样本的最优BBF动作
+            actions_rftn: (B,) 每个样本的最优RFTN动作
+        """
+        batch_size = state_t.shape[0]
+        device = state_t.device
+        
+        # 存储每个样本的最优动作
+        actions_bbf = torch.zeros(batch_size, dtype=torch.long, device=device)
+        actions_rftn = torch.zeros(batch_size, dtype=torch.long, device=device)
+        
+        # 方案1：简单循环（稳定可靠）
+        # 对每个样本独立搜索
+        for b in range(batch_size):
+            # 提取第b个样本
+            state_0_b = state_0[b:b+1]
+            state_t_b = state_t[b:b+1]
+            action_prev_b = (action_prev[0][b:b+1], action_prev[1][b:b+1])
+            option_t_b = option_t[b:b+1]
+            padding_mask_b = padding_mask[b:b+1] if padding_mask is not None else None
+            
+            # 对第b个样本执行MCTS
+            action_bbf, action_rftn = self.search(
+                state_0_b, state_t_b, action_prev_b, option_t_b,
+                padding_mask_b, offset
+            )
+            
+            actions_bbf[b] = action_bbf
+            actions_rftn[b] = action_rftn
+        
+        return actions_bbf, actions_rftn
+    
+    @torch.no_grad()
+    def batch_search_fast(self,
+                          state_0: torch.Tensor,
+                          state_t: torch.Tensor,
+                          action_prev: Tuple[torch.Tensor, torch.Tensor],
+                          option_t: torch.Tensor,
+                          padding_mask: Optional[torch.Tensor] = None,
+                          offset: int = 0,
+                          max_samples: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        快速批量MCTS（只对部分样本搜索）
+        
+        对计算资源有限时的折中方案：
+        - 只对batch中前max_samples个样本执行MCTS
+        - 其余样本使用贪婪策略
+        
+        Args:
+            max_samples: 最多对多少个样本执行MCTS（None=全部）
+            
+        Returns:
+            actions_bbf: (B,)
+            actions_rftn: (B,)
+        """
+        batch_size = state_t.shape[0]
+        device = state_t.device
+        
+        # 确定实际搜索的样本数
+        if max_samples is None:
+            n_search = batch_size
+        else:
+            n_search = min(max_samples, batch_size)
+        
+        # 先用贪婪策略初始化所有动作
+        policy_t, _ = self.model.prediction(torch.reshape(state_t, (batch_size, -1)))
+        actions_bbf = policy_t[0].argmax(dim=-1)  # (B,)
+        actions_rftn = policy_t[1].argmax(dim=-1)  # (B,)
+        
+        # 对前n_search个样本执行MCTS
+        for b in range(n_search):
+            state_0_b = state_0[b:b+1]
+            state_t_b = state_t[b:b+1]
+            action_prev_b = (action_prev[0][b:b+1], action_prev[1][b:b+1])
+            option_t_b = option_t[b:b+1]
+            padding_mask_b = padding_mask[b:b+1] if padding_mask is not None else None
+            
+            # MCTS搜索
+            action_bbf, action_rftn = self.search(
+                state_0_b, state_t_b, action_prev_b, option_t_b,
+                padding_mask_b, offset
+            )
+            
+            # 更新为MCTS结果
+            actions_bbf[b] = action_bbf
+            actions_rftn[b] = action_rftn
+        
+        return actions_bbf, actions_rftn
     
     def _simulate(self, node: MCTSNode, state_0, action_prev, option_t, padding_mask, offset):
         """

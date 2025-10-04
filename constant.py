@@ -72,6 +72,10 @@ mcts_simulations = 50  # MCTS每次搜索的模拟次数
 mcts_c_puct = 1.0  # MCTS的探索常数（UCB）
 use_mcts_margin = 0.1  # MCTS动作需要比专家好多少才使用（margin）
 
+# 批量MCTS配置
+use_mcts_batch_search = False  # True=对所有样本MCTS（慢但完整），False=只对部分样本（快）
+mcts_batch_samples = 32  # 快速模式下，每个batch最多对多少样本执行MCTS
+
 # 训练策略配置
 warmup_epochs = 10  # 前N个epoch只训练环境模型，不训练policy
 env_loss_weight = 2.0  # warmup后，环境模型loss的权重（相对policy）

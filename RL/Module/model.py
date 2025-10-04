@@ -293,63 +293,86 @@ class TransformerPlanningModel(nn.Module):
             action_expert_bbf = action_t[0][:, i]  # (B,)
             action_expert_rftn = action_t[1][:, i]
             
-            # MCTS引导训练
+            # MCTS引导训练（批量版本）
             if self.use_mcts and self.mcts is not None and self.training:
-                # 使用MCTS搜索找到高价值动作
+                # 使用批量MCTS搜索
                 with torch.no_grad():
-                    # 对batch中的每个样本执行MCTS（简化版：只对第一个样本）
-                    # 生产环境可以并行化或减少搜索次数
-                    action_mcts_bbf, action_mcts_rftn = self.mcts.search(
-                        state_0=state_0,
-                        state_t=state_t,
-                        action_prev=action_prev,
-                        option_t=option_t,
-                        padding_mask=padding_mask,
-                        offset=1+i
-                    )
+                    # 批量搜索：对batch中所有样本执行MCTS
+                    # 可选：使用batch_search_fast(max_samples=32)只对部分样本搜索
+                    if use_mcts_batch_search:
+                        # 完整批量搜索
+                        actions_mcts_bbf, actions_mcts_rftn = self.mcts.batch_search(
+                            state_0=state_0,
+                            state_t=state_t,
+                            action_prev=action_prev,
+                            option_t=option_t,
+                            padding_mask=padding_mask,
+                            offset=1+i
+                        )
+                    else:
+                        # 快速模式：只对部分样本搜索
+                        actions_mcts_bbf, actions_mcts_rftn = self.mcts.batch_search_fast(
+                            state_0=state_0,
+                            state_t=state_t,
+                            action_prev=action_prev,
+                            option_t=option_t,
+                            padding_mask=padding_mask,
+                            offset=1+i,
+                            max_samples=mcts_batch_samples
+                        )
                     
-                    # 评估MCTS动作的Q值
-                    action_mcts_tensor = self._construct_action_tensor(
-                        (action_mcts_bbf, action_mcts_rftn), action_prev
-                    )
+                    # 评估MCTS动作的Q值（批量）
+                    batch_size = state_t.shape[0]
+                    mcts_action_bbf = torch.zeros(batch_size, dtype=torch.long, device=state_t.device)
+                    mcts_action_rftn = torch.zeros(batch_size, dtype=torch.long, device=state_t.device)
+                    mcts_weight = torch.zeros(batch_size, device=state_t.device)
+                    
                     option_now = torch.zeros_like(option_prev)
                     option_now[:, 0] = option_t[:, i]
                     
-                    _, reward_mcts = self.dynamics(
-                        state_t, action_mcts_tensor, option_now,
-                        padding_mask=padding_mask, state_0=state_0, offset=1+i
-                    )
-                    Q_mcts = reward_mcts + gamma * value_t
-                    
-                    # 评估专家动作的Q值
-                    action_expert_tensor = self._construct_action_tensor(
-                        (action_expert_bbf[0], action_expert_rftn[0]), action_prev
-                    )
-                    _, reward_expert = self.dynamics(
-                        state_t, action_expert_tensor, option_now,
-                        padding_mask=padding_mask, state_0=state_0, offset=1+i
-                    )
-                    Q_expert = reward_expert + gamma * value_t
-                    
-                    # 如果MCTS找到更好的动作，使用它；否则用专家动作
-                    use_mcts_action = (Q_mcts > Q_expert + use_mcts_margin)  # margin确保显著更好
-                    
-                    if use_mcts_action.item():
-                        mcts_action_bbf = torch.tensor([action_mcts_bbf], device=state_t.device)
-                        mcts_action_rftn = torch.tensor([action_mcts_rftn], device=state_t.device)
-                        mcts_weight = torch.ones(1, device=state_t.device)
-                    else:
-                        mcts_action_bbf = action_expert_bbf
-                        mcts_action_rftn = action_expert_rftn
-                        mcts_weight = torch.zeros(1, device=state_t.device)
+                    # 对每个样本评估MCTS vs 专家
+                    for b in range(batch_size):
+                        # 评估MCTS动作
+                        action_mcts_tensor = self._construct_action_tensor(
+                            (actions_mcts_bbf[b].item(), actions_mcts_rftn[b].item()), 
+                            (action_prev[0][b:b+1], action_prev[1][b:b+1])
+                        )
+                        _, reward_mcts = self.dynamics(
+                            state_t[b:b+1], action_mcts_tensor, option_now[b:b+1],
+                            padding_mask=padding_mask[b:b+1] if padding_mask is not None else None,
+                            state_0=state_0[b:b+1], offset=1+i
+                        )
+                        Q_mcts = reward_mcts + gamma * value_t[b:b+1]
+                        
+                        # 评估专家动作
+                        action_expert_tensor = self._construct_action_tensor(
+                            (action_expert_bbf[b].item(), action_expert_rftn[b].item()),
+                            (action_prev[0][b:b+1], action_prev[1][b:b+1])
+                        )
+                        _, reward_expert = self.dynamics(
+                            state_t[b:b+1], action_expert_tensor, option_now[b:b+1],
+                            padding_mask=padding_mask[b:b+1] if padding_mask is not None else None,
+                            state_0=state_0[b:b+1], offset=1+i
+                        )
+                        Q_expert = reward_expert + gamma * value_t[b:b+1]
+                        
+                        # 如果MCTS找到更好的动作
+                        if Q_mcts.item() > Q_expert.item() + use_mcts_margin:
+                            mcts_action_bbf[b] = actions_mcts_bbf[b]
+                            mcts_action_rftn[b] = actions_mcts_rftn[b]
+                            mcts_weight[b] = 1.0
+                        else:
+                            mcts_action_bbf[b] = action_expert_bbf[b]
+                            mcts_action_rftn[b] = action_expert_rftn[b]
+                            mcts_weight[b] = 0.0
                 
-                # Rollout动作选择
+                # Rollout动作选择（使用第一个样本的动作）
                 if teacher_forcing:
                     # 用专家动作rollout（更稳定，推荐）
-                    action_for_rollout = (action_expert_bbf[0], action_expert_rftn[0])
+                    action_for_rollout = (action_expert_bbf[0].item(), action_expert_rftn[0].item())
                 else:
                     # 用MCTS动作rollout（更激进）
-                    action_for_rollout = (mcts_action_bbf[0], mcts_action_rftn[0])
+                    action_for_rollout = (mcts_action_bbf[0].item(), mcts_action_rftn[0].item())
             else:
                 # 不使用MCTS：标准训练
                 if sample_train:
@@ -357,10 +380,10 @@ class TransformerPlanningModel(nn.Module):
                 else:
                     action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))
                 
-                action_for_rollout = (action_t_pred[0][0], action_t_pred[1][0])
+                action_for_rollout = (action_t_pred[0].item(), action_t_pred[1].item())
                 mcts_action_bbf = action_expert_bbf  # fallback to BC
                 mcts_action_rftn = action_expert_rftn
-                mcts_weight = torch.zeros(1, device=state_t.device)
+                mcts_weight = torch.zeros(action_expert_bbf.shape[0], device=state_t.device)
             
             # 构造rollout动作张量
             action_now = self._construct_action_tensor(action_for_rollout, action_prev)
