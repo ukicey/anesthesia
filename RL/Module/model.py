@@ -366,40 +366,48 @@ class TransformerPlanningModel(nn.Module):
                             mcts_action_rftn[b] = action_expert_rftn[b]
                             mcts_weight[b] = 0.0
                 
-                # Rollout动作选择（使用第一个样本的动作）
+                # Rollout动作选择（batch维度）
                 if teacher_forcing:
                     # 用专家动作rollout（更稳定，推荐）
-                    action_for_rollout = (action_expert_bbf[0].item(), action_expert_rftn[0].item())
+                    action_for_rollout_bbf = action_expert_bbf  # (B,)
+                    action_for_rollout_rftn = action_expert_rftn  # (B,)
                 else:
                     # 用MCTS动作rollout（更激进）
-                    action_for_rollout = (mcts_action_bbf[0].item(), mcts_action_rftn[0].item())
+                    action_for_rollout_bbf = mcts_action_bbf  # (B,)
+                    action_for_rollout_rftn = mcts_action_rftn  # (B,)
             else:
                 # 不使用MCTS：标准训练
                 if sample_train:
-                    action_t_pred = (dist[0].sample(), dist[1].sample())
+                    action_t_pred = (dist[0].sample(), dist[1].sample())  # (B,)
                 else:
-                    action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))
+                    action_t_pred = (policy_t[0].argmax(dim=-1), policy_t[1].argmax(dim=-1))  # (B,)
                 
-                action_for_rollout = (action_t_pred[0].item(), action_t_pred[1].item())
+                action_for_rollout_bbf = action_t_pred[0]  # (B,)
+                action_for_rollout_rftn = action_t_pred[1]  # (B,)
                 mcts_action_bbf = action_expert_bbf  # fallback to BC
                 mcts_action_rftn = action_expert_rftn
                 mcts_weight = torch.zeros(action_expert_bbf.shape[0], device=state_t.device)
             
-            # 构造rollout动作张量
-            action_now = self._construct_action_tensor(action_for_rollout, action_prev)
+            # 构造rollout动作张量（batch维度）
+            action_now_bbf = torch.zeros_like(action_prev[0])  # (B, L)
+            action_now_rftn = torch.zeros_like(action_prev[1])  # (B, L)
+            action_now_bbf[:, 0] = action_for_rollout_bbf  # (B,) -> (B, L)
+            action_now_rftn[:, 0] = action_for_rollout_rftn  # (B,)
+            action_now = (action_now_bbf, action_now_rftn)
+            
             option_now = torch.zeros_like(option_prev)
             option_now[:, 0] = option_t[:, i]
             
-            # Dynamics推进
+            # Dynamics推进（batch维度）
             state_t_next_pred, reward_t_pred = self.dynamics(
                 state_t, action_now, option_now,
                 padding_mask=padding_mask, state_0=state_0, offset=1+i
             )
             
-            # 计算log prob
+            # 计算log prob（batch维度）
             action_t_logprob = (
-                dist[0].log_prob(torch.tensor([action_for_rollout[0]], device=state_t.device)),
-                dist[1].log_prob(torch.tensor([action_for_rollout[1]], device=state_t.device))
+                dist[0].log_prob(action_for_rollout_bbf),  # (B,)
+                dist[1].log_prob(action_for_rollout_rftn)  # (B,)
             )
 
             # 收集结果
